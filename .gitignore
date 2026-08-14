@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+fantasy_2026_hr/
+.DS_Store

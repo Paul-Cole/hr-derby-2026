@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hr-derby-2026
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn fantasy_2026_app:server --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: TRACK_DIR
+        value: /tmp/fantasy_2026_hr
