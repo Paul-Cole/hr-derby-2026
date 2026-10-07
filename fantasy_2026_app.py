@@ -80,6 +80,11 @@ TEAM_COLORS = {
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "mlb-fantasy-hr-derby/2026"})
 
+# statsapi gameLog defaults to regular season only, so October games vanish from
+# the log unless every postseason round is asked for by name:
+# R regular, F wild card, D division, L championship, W World Series.
+GAME_TYPES = "R,F,D,L,W"
+
 BG = "#0b1220"
 CARD = "#121a2b"
 TEXT = "#e8eef9"
@@ -99,24 +104,28 @@ def fetch_game_log(player_id: int) -> list[dict]:
     url = f"https://statsapi.mlb.com/api/v1/people/{int(player_id)}/stats"
     resp = SESSION.get(
         url,
-        params={"stats": "gameLog", "group": "hitting", "season": SEASON},
+        params={
+            "stats": "gameLog",
+            "group": "hitting",
+            "season": SEASON,
+            "gameType": GAME_TYPES,
+        },
         timeout=30,
     )
     resp.raise_for_status()
-    stats = resp.json().get("stats") or []
-    splits = stats[0].get("splits", []) if stats else []
     rows = []
-    for split in splits:
-        day = _parse_day(split.get("date"))
-        if day is None or day < START:
-            continue
-        rows.append(
-            {
-                "player_id": int(player_id),
-                "date": day,
-                "hr": int(split.get("stat", {}).get("homeRuns") or 0),
-            }
-        )
+    for block in resp.json().get("stats") or []:
+        for split in block.get("splits", []):
+            day = _parse_day(split.get("date"))
+            if day is None or day < START:
+                continue
+            rows.append(
+                {
+                    "player_id": int(player_id),
+                    "date": day,
+                    "hr": int(split.get("stat", {}).get("homeRuns") or 0),
+                }
+            )
     return rows
 
 
@@ -190,13 +199,24 @@ def load_hr_data() -> dict:
         print(f"today boxscore failed: {exc}")
         live = {}
 
+    if not logs.empty:
+        # one row per player-day; a doubleheader arrives as two splits
+        logs = logs.groupby(["player_id", "date"], as_index=False)["hr"].sum()
+
     if live:
         live_df = pd.DataFrame(
             [{"player_id": pid, "date": today, "hr": hr} for pid, hr in live.items() if hr]
         )
         if not live_df.empty:
-            logs = pd.concat([logs, live_df], ignore_index=True)
-            logs = logs.groupby(["player_id", "date"], as_index=False)["hr"].max()
+            # Today can come from both sources; keep the higher count. Earlier days
+            # stay summed so doubleheaders aren't flattened to a single game.
+            rest = logs[logs["date"] != today]
+            merged_today = (
+                pd.concat([logs[logs["date"] == today], live_df], ignore_index=True)
+                .groupby(["player_id", "date"], as_index=False)["hr"]
+                .max()
+            )
+            logs = pd.concat([rest, merged_today], ignore_index=True)
 
     players = roster_df.merge(logs, on="player_id", how="left")
     players["date"] = pd.to_datetime(players["date"]).dt.date
