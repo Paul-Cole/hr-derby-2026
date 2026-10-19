@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
@@ -85,6 +86,17 @@ SESSION.headers.update({"User-Agent": "mlb-fantasy-hr-derby/2026"})
 # R regular, F wild card, D division, L championship, W World Series.
 GAME_TYPES = "R,F,D,L,W"
 
+# MLB files a game under its US/Eastern date, so a 8pm ET first pitch belongs to
+# that day even though it is already tomorrow in UTC. The server clock is UTC on
+# Render, so asking it for "today" loses the whole evening slate.
+ET = ZoneInfo("America/New_York")
+
+
+def mlb_today() -> date:
+    """The date MLB is currently filing games under."""
+    return datetime.now(ET).date()
+
+
 BG = "#0b1220"
 CARD = "#121a2b"
 TEXT = "#e8eef9"
@@ -150,34 +162,45 @@ def _boxscore_hrs(game_pk: int, player_ids: set[int]) -> dict[int, int]:
     return found
 
 
-def fetch_today_boxscore_hr(player_ids: set[int], day: date) -> dict[int, int]:
-    """HR from today's boxscores, including in-progress games."""
-    resp = SESSION.get(
-        "https://statsapi.mlb.com/api/v1/schedule",
-        params={"sportId": 1, "date": day.isoformat()},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    pks = []
-    for day_block in resp.json().get("dates", []):
-        for game in day_block.get("games", []):
-            state = (game.get("status") or {}).get("abstractGameState")
-            if state in {"Live", "Final"}:
-                pks.append(game["gamePk"])
-    out: dict[int, int] = {pid: 0 for pid in player_ids}
+def fetch_live_boxscore_hr(
+    player_ids: set[int], days: list[date]
+) -> dict[tuple[int, date], int]:
+    """HR from recent boxscores, including in-progress games.
+
+    Keyed by the game's own official date as the schedule reports it, so a game
+    still being played after midnight UTC lands on the day MLB filed it under.
+    A game that runs past midnight ET is why yesterday is in the window too.
+    """
+    games: list[tuple[int, date]] = []
+    for day in days:
+        resp = SESSION.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId": 1, "date": day.isoformat()},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        for day_block in resp.json().get("dates", []):
+            block_day = _parse_day(day_block.get("date")) or day
+            for game in day_block.get("games", []):
+                state = (game.get("status") or {}).get("abstractGameState")
+                if state in {"Live", "Final"}:
+                    games.append((game["gamePk"], block_day))
+
+    out: dict[tuple[int, date], int] = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = [pool.submit(_boxscore_hrs, pk, player_ids) for pk in pks]
+        futs = {pool.submit(_boxscore_hrs, pk, player_ids): day for pk, day in games}
         for fut in as_completed(futs):
+            day = futs[fut]
             try:
                 for pid, hr in fut.result().items():
-                    out[pid] += hr
+                    out[(pid, day)] = out.get((pid, day), 0) + hr
             except Exception as exc:
                 print(f"boxscore failed: {exc}")
     return out
 
 
 def load_hr_data() -> dict:
-    today = datetime.now().date()
+    today = mlb_today()
     ids = list(roster_df["player_id"])
     log_rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=12) as pool:
@@ -194,9 +217,9 @@ def load_hr_data() -> dict:
         logs = pd.DataFrame(columns=["player_id", "date", "hr"])
 
     try:
-        live = fetch_today_boxscore_hr(set(ids), today)
+        live = fetch_live_boxscore_hr(set(ids), [today - timedelta(days=1), today])
     except Exception as exc:
-        print(f"today boxscore failed: {exc}")
+        print(f"live boxscore failed: {exc}")
         live = {}
 
     if not logs.empty:
@@ -205,18 +228,23 @@ def load_hr_data() -> dict:
 
     if live:
         live_df = pd.DataFrame(
-            [{"player_id": pid, "date": today, "hr": hr} for pid, hr in live.items() if hr]
+            [
+                {"player_id": pid, "date": day, "hr": hr}
+                for (pid, day), hr in live.items()
+                if hr
+            ]
         )
         if not live_df.empty:
-            # Today can come from both sources; keep the higher count. Earlier days
-            # stay summed so doubleheaders aren't flattened to a single game.
-            rest = logs[logs["date"] != today]
-            merged_today = (
-                pd.concat([logs[logs["date"] == today], live_df], ignore_index=True)
+            # These days can arrive from both sources; keep the higher count. Other
+            # days stay summed so doubleheaders aren't flattened to a single game.
+            live_days = set(live_df["date"])
+            in_window = logs["date"].isin(live_days)
+            merged = (
+                pd.concat([logs[in_window], live_df], ignore_index=True)
                 .groupby(["player_id", "date"], as_index=False)["hr"]
                 .max()
             )
-            logs = pd.concat([rest, merged_today], ignore_index=True)
+            logs = pd.concat([logs[~in_window], merged], ignore_index=True)
 
     players = roster_df.merge(logs, on="player_id", how="left")
     players["date"] = pd.to_datetime(players["date"]).dt.date
@@ -268,7 +296,7 @@ def load_hr_data() -> dict:
     player_tot = player_tot.merge(player_today, on="player_id", how="left")
     player_tot["today_hr"] = player_tot["today_hr"].fillna(0).astype(int)
 
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     try:
         player_tot.assign(as_of=stamp).to_csv(
             TRACK_DIR / f"snapshot_{today.isoformat()}.csv", index=False
